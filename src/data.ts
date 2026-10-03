@@ -1,4 +1,5 @@
 import type { Course, PersistedState } from './types';
+import { freezeSentences, questionVersionOf } from './utils';
 
 export const demoCourses: Course[] = [
   {
@@ -64,24 +65,36 @@ export const demoCourses: Course[] = [
   }
 ];
 
+const airport01 = demoCourses[0].lessons[0];
+const demoFrozen = freezeSentences(airport01.sentences);
+
 export const createInitialState = (): PersistedState => ({
-  schemaVersion: 1,
+  schemaVersion: 2,
   courses: structuredClone(demoCourses),
   attempts: [
     {
       id: 'demo-attempt-1',
+      sessionId: 'demo-session-1',
       lessonId: 'airport-01',
       lessonTitle: '办理值机',
       courseTitle: '日常英语 · 机场与出行',
       submittedAt: '2026-09-24T10:20:00.000Z',
-      score: 84,
+      score: 100,
       teacherFeedback: '连读细节明显进步。注意 bags are 的词尾衔接，再听一遍第二句。',
+      sessionStatus: 'submitted',
+      startedAt: '2026-09-24T10:12:00.000Z',
+      durationSec: 480,
+      questionVersion: questionVersionOf(airport01.sentences),
+      frozenSentences: structuredClone(demoFrozen),
+      mappings: demoFrozen.map((sentence) => ({ frozenId: sentence.sentenceId, status: 'matched', currentSentenceId: sentence.sentenceId })),
       sentenceAttempts: [
         {
           sentenceId: 'airport-01-s1',
           source: 'I would like to check in for my flight to London.',
           answer: 'I would like to check in for my flight to London',
-          score: 94,
+          score: 100,
+          scored: true,
+          mappingStatus: 'matched',
           tokens: [
             { index: 0, expected: 'I', actual: 'I', correct: true, category: 'unclassified', reason: '' },
             { index: 1, expected: 'would', actual: 'would', correct: true, category: 'unclassified', reason: '' },
@@ -106,6 +119,9 @@ export const createInitialState = (): PersistedState => ({
       updatedAt: '2026-09-24T10:10:00.000Z'
     }
   },
+  sessions: [],
+  lessonExamSettings: {},
+  activeSessionId: '',
   activeLessonId: '',
   activeSentenceId: '',
   theme: 'light',
