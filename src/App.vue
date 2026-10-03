@@ -1,10 +1,28 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { courseForLesson, exportRecords, lessonById, persist, saveAttempt, setDownloaded, state, updateTokenClassification } from './store';
-import type { ErrorCategory, Lesson, PracticeAttempt, PracticeView } from './types';
-import { compareSentence, scoreAttempt, segmentText } from './utils';
+import {
+  activeExamForLesson,
+  courseForLesson,
+  examSessionById,
+  exportRecords,
+  finalizeExamSession,
+  lessonById,
+  lessons as listLessons,
+  persist,
+  reconcileActiveExamSessions,
+  saveAttempt,
+  saveExamAnswer,
+  setDownloaded,
+  setExamActiveSentence,
+  startExamSession,
+  state,
+  sweepExpiredExamSessions,
+  updateLessonSentences,
+  updateTokenClassification
+} from './store';
+import type { ErrorCategory, ExamSession, ExamSessionStatus, Lesson, PracticeAttempt, PracticeView, Sentence } from './types';
+import { compareSentence, deepClone, scoreAttempt, segmentText } from './utils';
 
-const view = ref<PracticeView>(state.activeLessonId ? 'practice' : 'library');
 const online = ref(navigator.onLine);
 const toast = ref('');
 const resultAttemptId = ref('');
@@ -13,7 +31,27 @@ const segmentStart = ref(0);
 const segmentEnd = ref(1);
 const teacherAttemptId = ref(state.attempts[0]?.id ?? '');
 const teacherDraft = ref(state.attempts[0]?.teacherFeedback ?? '');
+const nowTick = ref(Date.now());
+const examSetupLessonId = ref('');
+const examDuration = ref(10);
+const examAnswer = ref('');
+const editorLessonId = ref('');
+const editorSentences = ref<Sentence[]>([]);
 let toastTimer = 0;
+let ticker = 0;
+
+function notify(message: string) {
+  toast.value = message;
+  window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => { toast.value = ''; }, 2400);
+}
+
+// 启动时先为未收卷场次重新确认词位，再按真实经过时间收卷，最后决定恢复到哪个视图。
+reconcileActiveExamSessions();
+const bootExpired = sweepExpiredExamSessions();
+const bootExam = examSessionById(state.activeExamId);
+const view = ref<PracticeView>(bootExam?.status === 'active' ? 'exam' : state.activeLessonId ? 'practice' : 'library');
+if (bootExpired.length) notify(`${bootExpired.length} 场限时听写已超时，系统按真实时间自动收卷`);
 
 const activeLesson = computed(() => lessonById(state.activeLessonId));
 const activeCourse = computed(() => activeLesson.value ? courseForLesson(activeLesson.value.id) : undefined);
@@ -35,9 +73,169 @@ const lessonCompletion = computed(() => {
 });
 const resultAttempt = computed(() => state.attempts.find((attempt) => attempt.id === resultAttemptId.value));
 const resultSentence = computed(() => resultAttempt.value?.sentenceAttempts[selectedResultSentence.value]);
+const resultExamSession = computed(() => resultAttempt.value?.examSessionId ? examSessionById(resultAttempt.value.examSessionId) : undefined);
 const teacherAttempt = computed(() => state.attempts.find((attempt) => attempt.id === teacherAttemptId.value));
 const totalWords = computed(() => state.attempts.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).length);
 const correctedWords = computed(() => state.attempts.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).filter((token) => !token.correct && token.category !== 'unclassified').length);
+const lessonOptions = computed(() => listLessons());
+
+// ---------- 限时听写场次 ----------
+
+const currentExam = computed(() => examSessionById(state.activeExamId));
+const examSentences = computed(() => currentExam.value?.frozenSentences ?? []);
+const examSentence = computed(() => {
+  const session = currentExam.value;
+  if (!session) return undefined;
+  return session.frozenSentences.find((sentence) => sentence.id === session.activeSentenceId) ?? session.frozenSentences[0];
+});
+const examIndex = computed(() => {
+  const session = currentExam.value;
+  if (!session || !examSentence.value) return 0;
+  return Math.max(0, session.frozenSentences.findIndex((sentence) => sentence.id === examSentence.value?.id));
+});
+const examRemainingMs = computed(() => {
+  const session = currentExam.value;
+  if (!session) return 0;
+  return Math.max(0, new Date(session.deadlineAt).getTime() - nowTick.value);
+});
+const examUrgent = computed(() => examRemainingMs.value > 0 && examRemainingMs.value <= 60_000);
+const examCompletion = computed(() => {
+  const session = currentExam.value;
+  if (!session || !session.frozenSentences.length) return 0;
+  const answered = session.frozenSentences.filter((sentence) => (session.answers[sentence.id] ?? '').trim()).length;
+  return Math.round((answered / session.frozenSentences.length) * 100);
+});
+
+function formatDuration(ms: number): string {
+  const total = Math.ceil(ms / 1000);
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+}
+
+const examRemainingText = computed(() => formatDuration(examRemainingMs.value));
+
+function remainingForLesson(lessonId: string): string {
+  const session = activeExamForLesson(lessonId);
+  if (!session) return '';
+  return formatDuration(Math.max(0, new Date(session.deadlineAt).getTime() - nowTick.value));
+}
+
+function examStatusLabel(status?: ExamSessionStatus): string {
+  if (status === 'submitted') return '已交卷';
+  if (status === 'expired') return '超时收卷';
+  return '进行中';
+}
+
+function examStatusForAttempt(attempt: PracticeAttempt): string {
+  if (!attempt.examSessionId) return '';
+  const session = examSessionById(attempt.examSessionId);
+  return session ? `限时 · ${examStatusLabel(session.status)}` : '';
+}
+
+function examDurationOptions(lesson: Lesson): number[] {
+  return [...new Set([lesson.estimatedMinutes, 5, 10, 15, 20])].sort((a, b) => a - b);
+}
+
+function toggleExamSetup(lesson: Lesson) {
+  examSetupLessonId.value = examSetupLessonId.value === lesson.id ? '' : lesson.id;
+  examDuration.value = lesson.estimatedMinutes;
+}
+
+function enterExam(session: ExamSession) {
+  state.activeExamId = session.id;
+  view.value = 'exam';
+  persist();
+}
+
+function beginExam(lesson: Lesson) {
+  const session = startExamSession(lesson, examDuration.value);
+  examSetupLessonId.value = '';
+  enterExam(session);
+  notify(`限时 ${session.durationMinutes} 分钟，题目版本已冻结，到时自动收卷`);
+}
+
+function resumeExam(lesson: Lesson) {
+  const session = activeExamForLesson(lesson.id);
+  if (session) enterExam(session);
+}
+
+function goToExamSentence(index: number) {
+  const session = currentExam.value;
+  if (!session || !session.frozenSentences[index]) return;
+  setExamActiveSentence(session.id, session.frozenSentences[index].id);
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function openExamResult(session: ExamSession) {
+  if (!session.attemptId) return;
+  resultAttemptId.value = session.attemptId;
+  selectedResultSentence.value = 0;
+  syncSegment();
+  view.value = 'result';
+}
+
+function submitExam() {
+  const session = currentExam.value;
+  if (!session || session.status !== 'active') return;
+  const unanswered = session.frozenSentences.filter((sentence) => !(session.answers[sentence.id] ?? '').trim()).length;
+  if (unanswered && !window.confirm(`还有 ${unanswered} 句未作答，现在交卷吗？`)) return;
+  const attempt = finalizeExamSession(session, 'submitted');
+  if (attempt) notify('已交卷，逐词结果已生成');
+}
+
+watch(examSentence, (sentence) => {
+  const session = currentExam.value;
+  examAnswer.value = sentence && session ? session.answers[sentence.id] ?? '' : '';
+}, { immediate: true });
+
+watch(examAnswer, (value) => {
+  const session = currentExam.value;
+  const sentence = examSentence.value;
+  if (!session || !sentence || session.status !== 'active') return;
+  saveExamAnswer(session.id, sentence.id, value);
+});
+
+// 收卷后场次锁定，自动跳到结果快照，不能续写。
+watch(() => currentExam.value?.status, (status) => {
+  if (view.value === 'exam' && status && status !== 'active' && currentExam.value) {
+    openExamResult(currentExam.value);
+  }
+});
+
+// ---------- 教师课程内容维护 ----------
+
+watch(editorLessonId, (id) => {
+  const lesson = lessonById(id);
+  editorSentences.value = lesson ? deepClone(lesson.sentences) : [];
+});
+
+function addEditorSentence() {
+  editorSentences.value.push({
+    id: `${editorLessonId.value}-s${Date.now().toString(36)}`,
+    text: '',
+    translation: '',
+    note: ''
+  });
+}
+
+function removeEditorSentence(index: number) {
+  editorSentences.value.splice(index, 1);
+}
+
+function saveLessonEditor() {
+  const cleaned = editorSentences.value
+    .map((sentence) => ({ ...sentence, text: sentence.text.trim(), translation: sentence.translation.trim() }))
+    .filter((sentence) => sentence.text);
+  if (!cleaned.length) {
+    notify('课节至少保留一句');
+    return;
+  }
+  const changed = updateLessonSentences(editorLessonId.value, cleaned);
+  const lesson = lessonById(editorLessonId.value);
+  editorSentences.value = lesson ? deepClone(lesson.sentences) : [];
+  notify(changed ? `课程已更新，${changed} 场未收卷听写已重新确认词位` : '课程已保存，进行中的场次不受影响');
+}
 
 const categoryOptions: Array<{ value: ErrorCategory; label: string }> = [
   { value: 'unclassified', label: '未分类' },
@@ -79,12 +277,6 @@ watch(activeLesson, (lesson) => {
 watch(teacherAttemptId, (id) => {
   teacherDraft.value = state.attempts.find((attempt) => attempt.id === id)?.teacherFeedback ?? '';
 });
-
-function notify(message: string) {
-  toast.value = message;
-  window.clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => { toast.value = ''; }, 2400);
-}
 
 function startLesson(lesson: Lesson) {
   const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: lesson.sentences[0].id, updatedAt: new Date().toISOString() };
@@ -190,6 +382,12 @@ function saveTeacherFeedback() {
   notify('教师反馈已保存');
 }
 
+function backToLesson() {
+  const lesson = resultAttempt.value ? lessonById(resultAttempt.value.lessonId) : undefined;
+  if (lesson) startLesson(lesson);
+  else view.value = 'library';
+}
+
 function toggleTheme() {
   state.theme = state.theme === 'light' ? 'dark' : 'light';
 }
@@ -206,7 +404,7 @@ function downloadRecords() {
   anchor.download = `echo-step-records-${new Date().toISOString().slice(0, 10)}.json`;
   anchor.click();
   URL.revokeObjectURL(url);
-  notify('练习记录已导出');
+  notify('练习记录已导出（含场次状态与题目版本）');
 }
 
 function formatDate(value: string): string {
@@ -219,10 +417,23 @@ function onConnectionChange() {
 }
 
 function onVisibilityChange() {
-  if (document.visibilityState === 'hidden') persist();
+  if (document.visibilityState === 'hidden') {
+    // 切后台只暂停语音，答题与倒计时按真实时间继续。
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    persist();
+  } else {
+    nowTick.value = Date.now();
+    const expired = sweepExpiredExamSessions(nowTick.value);
+    if (expired.length) notify('时间到，已自动收卷');
+  }
 }
 
 onMounted(() => {
+  ticker = window.setInterval(() => {
+    nowTick.value = Date.now();
+    const expired = sweepExpiredExamSessions(nowTick.value);
+    if (expired.length) notify('时间到，已自动收卷');
+  }, 500);
   window.addEventListener('online', onConnectionChange);
   window.addEventListener('offline', onConnectionChange);
   window.addEventListener('visibilitychange', onVisibilityChange);
@@ -230,6 +441,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  window.clearInterval(ticker);
   window.removeEventListener('online', onConnectionChange);
   window.removeEventListener('offline', onConnectionChange);
   window.removeEventListener('visibilitychange', onVisibilityChange);
@@ -256,7 +468,7 @@ onBeforeUnmount(() => {
 
         <section class="hero">
           <h2>今天也把声音变成文字</h2>
-          <p>下载课程后可离线作答，答案和当前位置会自动恢复。</p>
+          <p>下载课程后可离线作答；限时听写按真实时间倒计时，到时自动收卷。</p>
           <div class="hero-stats">
             <div class="hero-stat"><strong>{{ state.attempts.length }}</strong><span>练习记录</span></div>
             <div class="hero-stat"><strong>{{ correctedWords }}</strong><span>已分类错误</span></div>
@@ -282,11 +494,26 @@ onBeforeUnmount(() => {
             <div><h3>{{ course.title }}</h3><p>{{ course.description }}</p></div>
             <span class="level-badge">{{ course.level }}</span>
           </div>
-          <div v-for="lesson in course.lessons" :key="lesson.id" class="lesson-row">
-            <div><h4>{{ lesson.title }}</h4><p>{{ lesson.subtitle }} · {{ lesson.sentences.length }} 句 · 约 {{ lesson.estimatedMinutes }} 分钟</p></div>
-            <div class="lesson-actions">
-              <var-switch :model-value="lesson.downloaded" @update:model-value="setDownloaded(lesson.id, $event as boolean)" />
-              <var-button type="primary" size="small" @click="startLesson(lesson)">{{ lesson.downloaded ? '继续' : '开始' }}</var-button>
+          <div v-for="lesson in course.lessons" :key="lesson.id" class="lesson-block">
+            <div class="lesson-row">
+              <div>
+                <h4>{{ lesson.title }}</h4>
+                <p>{{ lesson.subtitle }} · {{ lesson.sentences.length }} 句 · 约 {{ lesson.estimatedMinutes }} 分钟</p>
+                <p v-if="activeExamForLesson(lesson.id)" class="exam-live">● 限时听写进行中 · 剩 {{ remainingForLesson(lesson.id) }}</p>
+              </div>
+              <div class="lesson-actions">
+                <var-switch :model-value="lesson.downloaded" @update:model-value="setDownloaded(lesson.id, $event as boolean)" />
+                <var-button v-if="activeExamForLesson(lesson.id)" type="primary" size="small" @click="resumeExam(lesson)">继续听写</var-button>
+                <var-button v-else type="primary" variant="outline" size="small" @click="toggleExamSetup(lesson)">限时</var-button>
+                <var-button type="primary" size="small" @click="startLesson(lesson)">{{ lesson.downloaded ? '继续' : '开始' }}</var-button>
+              </div>
+            </div>
+            <div v-if="examSetupLessonId === lesson.id" class="exam-setup">
+              <div class="dictation-label"><strong>限时时长</strong><span>开始后冻结题目版本</span></div>
+              <div class="duration-chips">
+                <button v-for="minutes in examDurationOptions(lesson)" :key="minutes" class="duration-chip" :class="{ active: examDuration === minutes }" @click="examDuration = minutes">{{ minutes }} 分钟</button>
+              </div>
+              <var-button block type="primary" size="small" @click="beginExam(lesson)">开始限时听写</var-button>
             </div>
           </div>
         </article>
@@ -295,7 +522,10 @@ onBeforeUnmount(() => {
         <article v-if="state.attempts.length" class="panel">
           <div v-for="attempt in state.attempts.slice(0, 4)" :key="attempt.id" class="history-card">
             <div class="history-top"><strong>{{ attempt.lessonTitle }}</strong><span class="history-score">{{ attempt.score }} 分</span></div>
-            <p>{{ formatDate(attempt.submittedAt) }} · {{ attempt.teacherFeedback || '暂无教师反馈' }}</p>
+            <p>
+              <span v-if="examStatusForAttempt(attempt)" class="exam-badge">{{ examStatusForAttempt(attempt) }}</span>
+              {{ formatDate(attempt.submittedAt) }} · {{ attempt.teacherFeedback || '暂无教师反馈' }}
+            </p>
           </div>
           <var-button block type="primary" variant="outline" @click="downloadRecords">导出全部练习记录</var-button>
         </article>
@@ -339,6 +569,47 @@ onBeforeUnmount(() => {
         </section>
       </div>
 
+      <div v-else-if="view === 'exam' && currentExam && currentExam.status === 'active' && examSentence" class="page">
+        <header class="practice-header">
+          <div class="practice-nav">
+            <button class="back-button" aria-label="返回课程库" @click="view = 'library'">‹</button>
+            <div><h2>{{ currentExam.lessonTitle }} · 限时听写</h2></div>
+            <span class="timer-chip" :class="{ urgent: examUrgent }">⏱ {{ examRemainingText }}</span>
+          </div>
+          <div class="progress-line">
+            <div class="sentence-count"><span>第 {{ examIndex + 1 }} / {{ examSentences.length }} 句</span><span>{{ examCompletion }}% 已填写 · 到时自动收卷</span></div>
+            <var-progress :value="examCompletion" color="#d83b45" />
+          </div>
+        </header>
+
+        <div v-if="currentExam.pendingAnswers.length" class="pending-banner">
+          课程已更新，{{ currentExam.pendingAnswers.length }} 条原答案无法唯一匹配，已列入待确认且不计分。
+        </div>
+
+        <section class="audio-card">
+          <div class="audio-meta">
+            <button class="play-button" aria-label="播放当前句子" @click="replay(examSentence.text)">▶</button>
+            <div><strong>限时听写</strong><p>按真实时间倒计时，切后台只暂停语音，计时不会暂停。</p></div>
+          </div>
+        </section>
+
+        <div class="dictation-label"><strong>输入听到的内容</strong><span>答案随场次保存 · 断网可继续</span></div>
+        <textarea v-model="examAnswer" class="answer-box" :aria-label="`第 ${examIndex + 1} 句听写答案`" placeholder="Type what you hear..."></textarea>
+        <div class="practice-actions">
+          <var-button block type="default" variant="outline" @click="replay(examSentence.text)">再听一次</var-button>
+          <var-button block type="primary" @click="submitExam">交卷</var-button>
+        </div>
+
+        <div class="sentence-picker" aria-label="句子导航">
+          <button v-for="(sentence, index) in examSentences" :key="sentence.id" class="sentence-dot" :class="{ active: sentence.id === examSentence?.id, done: !!currentExam.answers[sentence.id] }" :aria-label="`跳到第 ${index + 1} 句`" @click="goToExamSentence(index)">{{ index + 1 }}</button>
+        </div>
+
+        <section class="panel">
+          <div class="detail-head"><div><h3>场景提示</h3><p>{{ examSentence.translation }}</p></div></div>
+          <div class="feedback-card">{{ examSentence.note }}</div>
+        </section>
+      </div>
+
       <div v-else-if="view === 'result' && resultAttempt" class="page">
         <header class="topbar">
           <button class="back-button" aria-label="返回课程库" @click="view = 'library'">‹</button>
@@ -350,6 +621,24 @@ onBeforeUnmount(() => {
           <div class="score-ring" :style="{ '--score': `${resultAttempt.score}%` }"><strong>{{ resultAttempt.score }}</strong></div>
           <h2>{{ resultAttempt.score >= 90 ? '几乎完美' : resultAttempt.score >= 70 ? '继续打磨细节' : '再听一遍会更好' }}</h2>
           <p>{{ resultAttempt.lessonTitle }} · 点击红色词可单独重听，并记录错误原因。</p>
+        </section>
+
+        <section v-if="resultExamSession" class="panel">
+          <div class="detail-head">
+            <div>
+              <h3>场次信息</h3>
+              <p>限时 {{ resultExamSession.durationMinutes }} 分钟 · 题目版本 {{ resultExamSession.questionVersion }} · 结果快照不受后续课程更新影响</p>
+            </div>
+            <span class="status-chip">{{ examStatusLabel(resultExamSession.status) }}</span>
+          </div>
+          <div v-if="resultExamSession.pendingAnswers.length">
+            <div class="dictation-label"><strong>待确认答案</strong><span>不计入得分</span></div>
+            <div v-for="(pending, index) in resultExamSession.pendingAnswers" :key="index" class="feedback-card">
+              <strong>原句：{{ pending.sourceText }}</strong>
+              <p>你的答案：{{ pending.answer }}</p>
+              <p>{{ pending.reason }}</p>
+            </div>
+          </div>
         </section>
 
         <div class="sentence-picker">
@@ -391,7 +680,7 @@ onBeforeUnmount(() => {
         </section>
 
         <section v-if="resultAttempt.teacherFeedback" class="panel"><div class="feedback-card"><strong>教师反馈</strong><p>{{ resultAttempt.teacherFeedback }}</p></div></section>
-        <var-button block type="primary" @click="startLesson(activeLesson!)">返回本次课程</var-button>
+        <var-button block type="primary" @click="backToLesson">返回本次课程</var-button>
         <var-button block type="default" variant="outline" style="margin-top: 10px" @click="downloadRecords">导出练习记录</var-button>
       </div>
 
@@ -415,6 +704,24 @@ onBeforeUnmount(() => {
           </template>
         </div>
         <div v-else class="empty-state"><strong>暂无学生作答</strong>学习端提交听写后，这里会出现练习记录。</div>
+
+        <div class="panel">
+          <div class="dictation-label"><strong>课程内容维护</strong><span>保存后未收卷场次重新确认词位</span></div>
+          <var-select v-model="editorLessonId" placeholder="选择课节">
+            <var-option v-for="lesson in lessonOptions" :key="lesson.id" :label="lesson.title" :value="lesson.id" />
+          </var-select>
+          <template v-if="editorLessonId">
+            <div v-for="(sentence, index) in editorSentences" :key="sentence.id" class="sentence-edit-row">
+              <div class="sentence-edit-head"><span>第 {{ index + 1 }} 句</span><button type="button" aria-label="删除该句" @click="removeEditorSentence(index)">删除</button></div>
+              <input v-model="sentence.text" placeholder="英文句子（原文）" aria-label="句子原文" />
+              <input v-model="sentence.translation" placeholder="中文提示" aria-label="中文提示" />
+            </div>
+            <div class="editor-actions">
+              <var-button type="default" variant="outline" size="small" @click="addEditorSentence">添加句子</var-button>
+              <var-button type="primary" size="small" @click="saveLessonEditor">保存课程修改</var-button>
+            </div>
+          </template>
+        </div>
       </div>
 
       <div v-if="toast" style="position: fixed; z-index: 30; left: 50%; bottom: 28px; transform: translateX(-50%); padding: 11px 16px; border-radius: 12px; background: #17233d; color: white; font-size: .78rem; box-shadow: 0 10px 30px rgb(0 0 0 / .2)">{{ toast }}</div>

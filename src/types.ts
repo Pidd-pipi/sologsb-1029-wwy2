@@ -1,6 +1,7 @@
 export type ErrorCategory = 'unclassified' | 'spelling' | 'omitted' | 'extra' | 'punctuation' | 'grammar';
-export type PracticeView = 'library' | 'practice' | 'result' | 'teacher';
+export type PracticeView = 'library' | 'practice' | 'exam' | 'result' | 'teacher';
 export type ThemeMode = 'light' | 'dark';
+export type ExamSessionStatus = 'active' | 'submitted' | 'expired';
 
 export interface Sentence {
   id: string;
@@ -55,6 +56,33 @@ export interface PracticeAttempt {
   score: number;
   sentenceAttempts: SentenceAttempt[];
   teacherFeedback: string;
+  examSessionId?: string;
+}
+
+export interface ExamPendingAnswer {
+  sentenceId: string;
+  sourceText: string;
+  answer: string;
+  reason: string;
+}
+
+export interface ExamSession {
+  id: string;
+  lessonId: string;
+  lessonTitle: string;
+  courseTitle: string;
+  status: ExamSessionStatus;
+  startedAt: string;
+  deadlineAt: string;
+  durationMinutes: number;
+  submittedAt: string | null;
+  questionVersion: string;
+  frozenSentences: Sentence[];
+  answers: Record<string, string>;
+  activeSentenceId: string;
+  pendingAnswers: ExamPendingAnswer[];
+  attemptId: string | null;
+  updatedAt: string;
 }
 
 export interface LessonProgress {
@@ -64,10 +92,12 @@ export interface LessonProgress {
 }
 
 export interface PersistedState {
-  schemaVersion: 1;
+  schemaVersion: 2;
   courses: Course[];
   attempts: PracticeAttempt[];
   progress: Record<string, LessonProgress>;
+  examSessions: ExamSession[];
+  activeExamId: string;
   activeLessonId: string;
   activeSentenceId: string;
   theme: ThemeMode;

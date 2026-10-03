@@ -1,7 +1,18 @@
-import type { SentenceAttempt, TextSegment, TokenResult } from './types';
+import type { Sentence, SentenceAttempt, TextSegment, TokenResult } from './types';
 
-export const segmentText = (text: string): TextSegment[] => {
-  const matches = text.match(/[\p{L}\p{N}]+(?:['’\-][\p{L}\p{N}]+)*|[^\s\p{L}\p{N}]+/gu) ?? [];
+export function sentenceSetVersion(sentences: Sentence[]): string {
+  const signature = sentences.map((sentence) => `${sentence.id}=${sentence.text}`).join('|');
+  let hash = 5381;
+  for (let i = 0; i < signature.length; i += 1) {
+    hash = ((hash << 5) + hash + signature.charCodeAt(i)) >>> 0;
+  }
+  return `v${sentences.length}-${hash.toString(36)}`;
+}
+
+/** 深拷贝可 JSON 序列化的数据；reactive 代理无法直接 structuredClone。 */
+export const deepClone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+
+export const segmentText = (text: string): TextSegment[] => {  const matches = text.match(/[\p{L}\p{N}]+(?:['’\-][\p{L}\p{N}]+)*|[^\s\p{L}\p{N}]+/gu) ?? [];
   return matches.map((display, index) => ({
     index,
     display,

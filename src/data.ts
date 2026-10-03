@@ -1,4 +1,5 @@
-import type { Course, PersistedState } from './types';
+import type { Course, ExamSession, PersistedState, PracticeAttempt, Sentence } from './types';
+import { compareSentence, scoreAttempt, sentenceSetVersion } from './utils';
 
 export const demoCourses: Course[] = [
   {
@@ -64,10 +65,71 @@ export const demoCourses: Course[] = [
   }
 ];
 
+// 已收卷的限时听写示例：冻结的是旧版题目（第四句在收卷后被课程更新加长），
+// 用于演示已收卷场次保存快照、不受新版本影响。
+const demoExamFrozen: Sentence[] = [
+  { id: 'airport-01-s1', text: 'I would like to check in for my flight to London.', translation: '我想办理飞往伦敦的航班值机。', note: 'check in 连读时重音落在 check。' },
+  { id: 'airport-01-s2', text: 'Could I have a window seat, please?', translation: '请问可以给我一个靠窗座位吗？', note: 'Could I 的 d 与 I 连读较轻。' },
+  { id: 'airport-01-s3', text: 'How many bags are you checking in today?', translation: '您今天要托运几件行李？', note: 'bags are 中 s 与 a 连读。' },
+  { id: 'airport-01-s4', text: 'Your gate is B twelve.', translation: '您的登机口是 B12。', note: '旧版短句，课程更新后已加长。' }
+];
+
+const demoExamAnswers: Record<string, string> = {
+  'airport-01-s1': 'I would like to check in for my flight to London.',
+  'airport-01-s2': 'Could I have a window seat please?',
+  'airport-01-s3': 'How many bag are you checking in today?',
+  'airport-01-s4': 'Your gate is B twelve.'
+};
+
+const demoExamSentenceAttempts = demoExamFrozen.map((sentence) => {
+  const answer = demoExamAnswers[sentence.id] ?? '';
+  const tokens = compareSentence(sentence.text, answer);
+  const correct = tokens.filter((token) => token.correct).length;
+  return {
+    sentenceId: sentence.id,
+    source: sentence.text,
+    answer,
+    tokens,
+    score: tokens.length ? Math.round((correct / tokens.length) * 100) : 0
+  };
+});
+
+const demoExamAttempt: PracticeAttempt = {
+  id: 'demo-exam-attempt-1',
+  lessonId: 'airport-01',
+  lessonTitle: '办理值机',
+  courseTitle: '日常英语 · 机场与出行',
+  submittedAt: '2026-09-28T09:15:00.000Z',
+  score: scoreAttempt(demoExamSentenceAttempts),
+  sentenceAttempts: demoExamSentenceAttempts,
+  teacherFeedback: '',
+  examSessionId: 'demo-exam-1'
+};
+
+const demoExamSession: ExamSession = {
+  id: 'demo-exam-1',
+  lessonId: 'airport-01',
+  lessonTitle: '办理值机',
+  courseTitle: '日常英语 · 机场与出行',
+  status: 'submitted',
+  startedAt: '2026-09-28T09:00:00.000Z',
+  deadlineAt: '2026-09-28T09:20:00.000Z',
+  durationMinutes: 20,
+  submittedAt: '2026-09-28T09:15:00.000Z',
+  questionVersion: sentenceSetVersion(demoExamFrozen),
+  frozenSentences: demoExamFrozen,
+  answers: demoExamAnswers,
+  activeSentenceId: 'airport-01-s4',
+  pendingAnswers: [],
+  attemptId: 'demo-exam-attempt-1',
+  updatedAt: '2026-09-28T09:15:00.000Z'
+};
+
 export const createInitialState = (): PersistedState => ({
-  schemaVersion: 1,
+  schemaVersion: 2,
   courses: structuredClone(demoCourses),
   attempts: [
+    demoExamAttempt,
     {
       id: 'demo-attempt-1',
       lessonId: 'airport-01',
@@ -106,6 +168,8 @@ export const createInitialState = (): PersistedState => ({
       updatedAt: '2026-09-24T10:10:00.000Z'
     }
   },
+  examSessions: [structuredClone(demoExamSession)],
+  activeExamId: '',
   activeLessonId: '',
   activeSentenceId: '',
   theme: 'light',

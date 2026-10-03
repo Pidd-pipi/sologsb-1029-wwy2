@@ -7,6 +7,7 @@
     "dev": "vite --host 0.0.0.0",
     "build": "vue-tsc --noEmit && vite build",
     "typecheck": "vue-tsc --noEmit",
+    "test:logic": "esbuild test-exam.mts --bundle --platform=node --format=esm --outfile=node_modules/.cache/test-exam.mjs && node node_modules/.cache/test-exam.mjs",
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
